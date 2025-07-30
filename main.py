@@ -39,7 +39,7 @@ def log(msg: str):
 def clean_text(text: str) -> str:
     """Remove bullets, emojis, and special characters for clean frontend output."""
     text = re.sub(r"^[\-\•\●\▪\♦\▶\★\*]+\s*", "", text)
-    text = re.sub(r"[^\w\s\.,:;!?/()-]", "", text)  # keep only safe characters
+    text = re.sub(r"[^\w\s\.,:;!?/()-]", "", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -127,10 +127,9 @@ async def ai_summarize_headlines(headlines: List[Dict], domain: str, types: List
                 expectations = snippet
                 highlights = title.split()[:3]
 
-                # Parse AI response line if available
                 if idx < len(ai_lines):
                     line = ai_lines[idx].strip()
-                    line = re.sub(r"[^\x20-\x7E]+", "", line)  # remove non-printable
+                    line = re.sub(r"[^\x20-\x7E]+", "", line)
                     m = re.match(
                         r'.*?"summary"\s*:\s*"([^"]+)"[^}]*"expectations"\s*:\s*"([^"]+)"[^}]*"highlights"\s*:\s*"([^"]+)"',
                         line
@@ -140,7 +139,6 @@ async def ai_summarize_headlines(headlines: List[Dict], domain: str, types: List
                         expectations = clean_text(m.group(2))
                         highlights = [clean_text(x) for x in m.group(3).split(",")]
 
-                # Ensure punctuation
                 if summary and not summary.endswith(('.', '!', '?')):
                     summary += '.'
 
@@ -159,7 +157,6 @@ async def ai_summarize_headlines(headlines: List[Dict], domain: str, types: List
 
         except Exception as e:
             log(f"⚠️ AI summarization error: {e}")
-            # Fallback
             for idx, h in enumerate(batch):
                 snippet = clean_text(h.get("snippet", ""))
                 title = clean_text(h["title"])
