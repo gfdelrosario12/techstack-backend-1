@@ -200,7 +200,8 @@ async def summarize_headline_search(query: str, domain: str, types: List[str]) -
 app = FastAPI(title="Tech Opportunities API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "https://techstack.vercel.app", "https://techstack-omega.vercel.app/"],
+    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "https://techstack.vercel.app", "https://techstack-omega.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
