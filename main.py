@@ -1,277 +1,235 @@
-import asyncio
+import re
 import os
-import uuid
 import datetime
-from typing import Dict, List
-from dotenv import load_dotenv
 import httpx
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from typing import List, Dict, Optional
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from fastapi import Request, HTTPException
 
-# === Load Environment Variables ===
+# === Load Env ===
 load_dotenv()
+BRAVE_API_KEY = os.getenv("BRAVE_API_KEY")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 
-# === OpenAI Client ===
-client_ai = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+if not BRAVE_API_KEY or not OPENAI_KEY:
+    raise RuntimeError("❌ Missing API keys in .env")
 
-# === Constants ===
-DUCKDUCKGO_SEARCH_URL = "https://html.duckduckgo.com/html/"
-BING_SEARCH_URL = "https://www.bing.com/search"
-SEARCH_DELAY = 2
-MAX_RESULTS = 10
-DAILY_LIMIT = 1
+client_ai = AsyncOpenAI(api_key=OPENAI_KEY)
 
-# Track API calls per day
-CALL_TRACKER = {"date": datetime.date.today(), "count": 0}
+# === Config ===
+MAX_CALLS_PER_DAY = 10
+MAX_RESULTS_PER_CALL = 10
+SUMMARY_BATCH_SIZE = 5
 
-# Tech domains and categories
-TECH_DOMAINS = ["cloud", "ai", "developer", "cybersecurity", "data", "networking"]
+daily_counters = {"date": datetime.date.today(), "calls": 0, "ai_calls": 0}
 
-OPPORTUNITY_TYPES = {
-    "certifications": ["certification", "exam", "official certificate"],
-    "vouchers": ["voucher", "discount", "free exam voucher"],
-    "courses": ["course", "learning path", "bootcamp"],
-    "events": ["event", "webinar", "hackathon"],
-}
 
-SOCIAL_PLATFORMS = [
-    "linkedin",
-    "reddit",
-    "facebook",
-    "medium",
-    "dev.to",
-    "devpost",
-]
-
-# === Logging Helper ===
-def log(message: str):
-    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}")
-
-# === Rate Limit Checker ===
-def check_rate_limit() -> bool:
+def reset_counters_if_new_day():
     today = datetime.date.today()
-    if CALL_TRACKER["date"] != today:
-        CALL_TRACKER["date"] = today
-        CALL_TRACKER["count"] = 0
-    if CALL_TRACKER["count"] >= DAILY_LIMIT:
-        log("❌ Daily API call limit reached")
-        return False
-    CALL_TRACKER["count"] += 1
-    log(f"✅ API call #{CALL_TRACKER['count']} for today")
-    return True
+    if daily_counters["date"] != today:
+        daily_counters.update({"date": today, "calls": 0, "ai_calls": 0})
 
-# === Helper Classes ===
-class OpportunityBot:
-    def __init__(self):
-        self.entries = {}
 
-    def is_duplicate(self, title, source):
-        return title in self.entries and source in self.entries[title]
+def log(msg: str):
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
-    def add_entry(self, title, source):
-        self.entries.setdefault(title, []).append(source)
-        return True
 
-# === Async Helpers ===
-async def search_engine(query: str, source: str, client: httpx.AsyncClient) -> List[Dict]:
-    """Search DuckDuckGo or Bing and return unique English results."""
+def clean_text(text: str) -> str:
+    """Remove bullets, emojis, and special characters for clean frontend output."""
+    text = re.sub(r"^[\-\•\●\▪\♦\▶\★\*]+\s*", "", text)
+    text = re.sub(r"[^\w\s\.,:;!?/()-]", "", text)  # keep only safe characters
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# === Brave Search ===
+async def brave_search(query: str) -> List[Dict]:
+    url = "https://api.search.brave.com/res/v1/web/search"
+    headers = {"Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY}
+    async with httpx.AsyncClient(timeout=15) as client:
+        log(f"🔍 Searching Brave: {query}")
+        res = await client.get(url, headers=headers, params={"q": query, "count": MAX_RESULTS_PER_CALL})
+        res.raise_for_status()
+        data = res.json()
+    return [
+        {
+            "title": item.get("title", ""),
+            "url": item.get("url", ""),
+            "snippet": item.get("description", ""),
+            "source": "brave",
+        }
+        for item in data.get("web", {}).get("results", [])[:MAX_RESULTS_PER_CALL]
+    ]
+
+
+# === AI Rating ===
+async def ai_rate_result(title: str, snippet: str, domain: str, types: List[str]) -> float:
+    reset_counters_if_new_day()
+    if daily_counters["ai_calls"] >= MAX_CALLS_PER_DAY:
+        return 0.5
+    content = f"Domain: {domain}\nTypes: {', '.join(types)}\nContent: {title} {snippet[:400]}"
     try:
-        log(f"🔍 Searching {source} for: {query}")
-        if source == "duckduckgo":
-            response = await client.post(DUCKDUCKGO_SEARCH_URL, data={"q": query, "kl": "us-en"})
-            links_selector = ".result a.result__a"
-        else:
-            response = await client.get(BING_SEARCH_URL, params={"q": query, "setLang": "EN"})
-            links_selector = "li.b_algo h2 a"
+        resp = await client_ai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Rate relevance from 0.0 to 1.0 for this domain and opportunity type."},
+                {"role": "user", "content": content},
+            ],
+            max_tokens=5,
+        )
+        daily_counters["ai_calls"] += 1
+        return float(resp.choices[0].message.content.strip())
+    except:
+        return 0.5
 
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        links = soup.select(links_selector)
 
-        seen_urls = set()
-        results = []
+# === AI Summarizer (Fine-Tuned) ===
+async def ai_summarize_headlines(headlines: List[Dict], domain: str, types: List[str]) -> List[Dict]:
+    summarized = []
+    type_str = ", ".join(types) if types else "tech opportunities"
 
-        for link in links[:5]:
-            title = link.get_text(strip=True)
-            url = link.get("href")
+    for i in range(0, len(headlines), SUMMARY_BATCH_SIZE):
+        batch = headlines[i:i + SUMMARY_BATCH_SIZE]
+        prompt = "\n".join([
+            f"Title: {h['title']}\nSnippet: {h.get('snippet','')}\nURL: {h['url']}"
+            for h in batch
+        ])
 
-            if not title or not url:
-                continue
+        try:
+            resp = await client_ai.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            f"You are a professional summarizer for {domain} {type_str}.\n"
+                            "Respond with one JSON object per line like this:\n"
+                            "{\"summary\": \"...\", \"expectations\": \"...\", \"highlights\": \"...\"}\n"
+                            "- summary: 1 short complete sentence, proper grammar.\n"
+                            "- expectations: what the user gains or learns.\n"
+                            "- highlights: 2-3 short keywords separated by commas.\n"
+                            "No bullets, emojis, or special characters."
+                        )
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=600,
+            )
 
-            # Skip non-English titles (basic ASCII check)
-            if sum(c.isascii() for c in title) / len(title) < 0.9:
-                log(f"⚠️ Skipped non-English: {title}")
-                continue
+            daily_counters["ai_calls"] += 1
+            ai_lines = resp.choices[0].message.content.strip().splitlines()
 
-            if url in seen_urls:
-                log(f"⚠️ Skipped duplicate URL: {url}")
-                continue
-            seen_urls.add(url)
+            for idx, h in enumerate(batch):
+                snippet = clean_text(h.get("snippet", ""))
+                title = clean_text(h["title"])
+                summary = snippet or title
+                expectations = snippet
+                highlights = title.split()[:3]
 
-            results.append({"title": title, "url": url, "source": source})
+                # Parse AI response line if available
+                if idx < len(ai_lines):
+                    line = ai_lines[idx].strip()
+                    line = re.sub(r"[^\x20-\x7E]+", "", line)  # remove non-printable
+                    m = re.match(
+                        r'.*?"summary"\s*:\s*"([^"]+)"[^}]*"expectations"\s*:\s*"([^"]+)"[^}]*"highlights"\s*:\s*"([^"]+)"',
+                        line
+                    )
+                    if m:
+                        summary = clean_text(m.group(1))
+                        expectations = clean_text(m.group(2))
+                        highlights = [clean_text(x) for x in m.group(3).split(",")]
 
-        log(f"✅ {len(results)} results from {source} for '{query}'")
-        return results[:2]  # return 2 results per engine
+                # Ensure punctuation
+                if summary and not summary.endswith(('.', '!', '?')):
+                    summary += '.'
 
-    except Exception as e:
-        log(f"❌ Search error on {source}: {e}")
+                summarized.append({
+                    "id": h["url"] or f"{domain}-{i}-{idx}",
+                    "label": title,
+                    "title": title,
+                    "url": h["url"],
+                    "summary": summary[:200],
+                    "description": snippet,
+                    "expectations": expectations,
+                    "highlights": highlights,
+                    "domain": domain,
+                    "source": "brave",
+                })
+
+        except Exception as e:
+            log(f"⚠️ AI summarization error: {e}")
+            # Fallback
+            for idx, h in enumerate(batch):
+                snippet = clean_text(h.get("snippet", ""))
+                title = clean_text(h["title"])
+                summarized.append({
+                    "id": h["url"] or f"{domain}-{i}-{idx}",
+                    "label": title,
+                    "title": title,
+                    "url": h["url"],
+                    "summary": snippet[:200] or title,
+                    "description": snippet,
+                    "expectations": snippet or title,
+                    "highlights": title.split()[:3],
+                    "domain": domain,
+                    "source": "brave",
+                })
+
+    return summarized
+
+
+# === Main Flow ===
+async def summarize_headline_search(query: str, domain: str, types: List[str]) -> List[Dict]:
+    reset_counters_if_new_day()
+    if daily_counters["calls"] >= MAX_CALLS_PER_DAY:
+        raise HTTPException(status_code=429, detail="Daily call limit reached (10 calls)")
+
+    daily_counters["calls"] += 1
+    results = await brave_search(query)
+    if not results:
         return []
 
-async def social_media_search(query: str, platform: str, client: httpx.AsyncClient) -> List[Dict]:
-    """Use DuckDuckGo to search inside a social platform."""
-    site_query = f"site:{platform} {query}"
-    results = await search_engine(site_query, "duckduckgo", client)
     for r in results:
-        r["platform"] = platform
-    return results
+        r["score"] = await ai_rate_result(r["title"], r.get("snippet", ""), domain, types)
+    sorted_results = sorted(results, key=lambda x: x["score"], reverse=True)
+    return await ai_summarize_headlines(sorted_results, domain, types)
 
-async def fetch_page_text(url: str, client: httpx.AsyncClient) -> str:
-    """Fetch and extract clean text from a URL."""
-    try:
-        log(f"🌐 Fetching page: {url}")
-        response = await client.get(url, timeout=8)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        return soup.get_text(separator=' ', strip=True)[:1200]
-    except Exception as e:
-        log(f"⚠️ Failed to fetch page {url}: {e}")
-        return ""
 
-# === AI Helpers ===
-async def formalize_title(title: str) -> str:
-    """Use GPT to make a title more formal, skip very short titles to save tokens."""
-    if not title or len(title.split()) <= 3:
-        return title
-    try:
-        log(f"🤖 Formalizing title: {title}")
-        response = await client_ai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": f"Make this tech title concise and formal:\n{title}"}],
-            max_tokens=15,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        log(f"⚠️ Title AI error: {e}")
-        return title
-
-async def summarize_opportunity(text: str, label: str) -> Dict:
-    """Summarize opportunity using GPT-4o-mini."""
-    if not text:
-        return {}
-    try:
-        log(f"📝 Summarizing {label} content")
-        response = await client_ai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": f"Summarize this {label} in 2-3 sentences:\n{text[:800]}"}],
-            max_tokens=120,
-        )
-        generated_text = response.choices[0].message.content.strip()
-        return {"summary": generated_text, "description": generated_text, "expectations": generated_text}
-    except Exception as e:
-        log(f"⚠️ Summary AI error: {e}")
-        return {}
-
-async def process_result(domain: str, query: str, label: str, entry: Dict, bot: OpportunityBot, client: httpx.AsyncClient):
-    normalized_title = entry["title"].strip().lower()
-    if bot.is_duplicate(normalized_title, entry["source"]):
-        log(f"⚠️ Skipped duplicate title: {entry['title']}")
-        return None
-
-    formal_title_task = asyncio.create_task(formalize_title(entry["title"]))
-    page_text_task = asyncio.create_task(fetch_page_text(entry["url"], client))
-    formal_title, page_text = await asyncio.gather(formal_title_task, page_text_task)
-
-    summary_data = await summarize_opportunity(page_text, label)
-    bot.add_entry(normalized_title, entry["source"])
-
-    log(f"✅ Processed: {formal_title}")
-    return {
-        "id": str(uuid.uuid4()),
-        "label": domain.capitalize(),
-        "title": formal_title,
-        "url": entry["url"],
-        "summary": summary_data.get("summary", ""),
-        "description": summary_data.get("description", ""),
-        "expectations": summary_data.get("expectations", ""),
-        "category_label": label.capitalize(),
-        "domain": domain,
-        "source": entry.get("source", ""),
-        "platform": entry.get("platform", ""),
-        "search_query": query
-    }
-
-# === FastAPI App ===
-origins = ["http://localhost:3000", "http://127.0.0.1:3000", "https://techstack.vercel.app"]
-app = FastAPI(title="Tech Certifications Finder API")
+# === FastAPI ===
+app = FastAPI(title="Tech Opportunities API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "https://techstack.vercel.app", "https://techstack-omega.vercel.app/"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 @app.get("/certifications")
-async def get_certifications(
-    domain: str = Query(...),
-    search: str = Query(""),
-    types: List[str] = Query(["certifications"]),
+async def certifications(
+    domain: str,
+    search: Optional[str] = "",
+    level: Optional[str] = "All",
+    types: str = "Certifications",
+    platforms: str = "",
 ):
-    if not check_rate_limit():
-        return JSONResponse(status_code=429, content={"error": "Daily API call limit reached (1 call/day)."})
+    query_parts = [domain]
+    if search:
+        query_parts.append(search)
+    if level and level != "All":
+        query_parts.append(level)
+    if types:
+        query_parts.append(types)
+    if platforms:
+        query_parts.append(platforms)
 
-    domain = domain.lower()
-    if domain not in TECH_DOMAINS:
-        return {"error": f"Invalid tech domain. Choose from {TECH_DOMAINS}"}
+    q = " ".join(query_parts)
+    type_list = types.split(",") if types else []
 
-    types = [t.lower() for t in types if t.lower() in OPPORTUNITY_TYPES] or ["certifications"]
+    return await summarize_headline_search(q, domain, type_list)
 
-    bot = OpportunityBot()
-    results_summary = []
-
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            for opp_type in types:
-                for keyword in OPPORTUNITY_TYPES[opp_type]:
-                    if len(results_summary) >= MAX_RESULTS:
-                        break
-
-                    query = f"{domain} {keyword} {search}"
-                    log(f"🔎 Starting search for '{query}'")
-
-                    for platform in SOCIAL_PLATFORMS:
-                        if len(results_summary) >= MAX_RESULTS:
-                            break
-                        results = await social_media_search(query, platform, client)
-                        for entry in results:
-                            if len(results_summary) >= MAX_RESULTS:
-                                break
-                            processed = await process_result(domain, query, opp_type, entry, bot, client)
-                            if processed:
-                                results_summary.append(processed)
-
-                    await asyncio.sleep(SEARCH_DELAY)
-
-        log(f"🎯 Completed: {len(results_summary)} results returned")
-        return {"count": len(results_summary), "results": results_summary}
-
-    except Exception as e:
-        log(f"❌ Server error: {e}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-@app.post("/reset-limit")
-async def reset_limit(request: Request):
-    client_ip = request.client.host
-    if client_ip not in ["127.0.0.1", "::1"]:
-        raise HTTPException(status_code=403, detail="Access forbidden")
-
-    CALL_TRACKER["date"] = datetime.date.today()
-    CALL_TRACKER["count"] = 0
-    return {"message": f"Daily limit reset for {CALL_TRACKER['date']}"}
 
 @app.get("/")
 def root():
