@@ -205,7 +205,7 @@ async def process_result(domain: str, query: str, label: str, entry: Dict, bot: 
     }
 
 # === FastAPI App ===
-origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+origins = ["http://localhost:3000", "http://127.0.0.1:3000", "https://techstack.vercel.app"]
 app = FastAPI(title="Tech Certifications Finder API")
 app.add_middleware(
     CORSMiddleware,
@@ -272,3 +272,7 @@ async def reset_limit(request: Request):
     CALL_TRACKER["date"] = datetime.date.today()
     CALL_TRACKER["count"] = 0
     return {"message": f"Daily limit reset for {CALL_TRACKER['date']}"}
+
+@app.get("/")
+def root():
+    return {"message": "Hello from FastAPI!"}
